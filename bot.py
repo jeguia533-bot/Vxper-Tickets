@@ -10,6 +10,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 MIN_STAFF_ROLE_ID = 1517932424414363818
 
+APPLICATION_CATEGORY_ID = 1517938703467548823
+
 APPLICATION_LOGS_CHANNEL_ID = 1517935931787706498
 ACCEPTED_APPLICATIONS_CHANNEL_ID = 1517936071571411206
 DENIED_APPLICATIONS_CHANNEL_ID = 1517936086473506976
@@ -225,6 +227,7 @@ class ApplyView(discord.ui.View):
             )
 
         required_role = guild.get_role(MIN_STAFF_ROLE_ID)
+        ticket_category = guild.get_channel(APPLICATION_CATEGORY_ID)
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -250,7 +253,7 @@ class ApplyView(discord.ui.View):
 
         ticket_channel = await guild.create_text_channel(
             name=ticket_name,
-            category=interaction.channel.category,
+            category=ticket_category,
             overwrites=overwrites,
             reason=f"VXPER application opened by {user}"
         )
