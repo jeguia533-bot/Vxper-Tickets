@@ -10,11 +10,11 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 MIN_STAFF_ROLE_ID = 1517947923009376289
 
-APPLICATION_CATEGORY_ID = 1517947925437874279
+TICKET_CATEGORY_ID = 1517947925437874279
 
 APPLICATION_LOGS_CHANNEL_ID = 1517947925253066902
-ACCEPTED_APPLICATIONS_CHANNEL_ID = 1517947925437874277
-DENIED_APPLICATIONS_CHANNEL_ID = 1517947925437874278
+APPROVED_CHANNEL_ID = 1517947925437874277
+DENIED_CHANNEL_ID = 1517947925437874278
 
 BOT_PREFIX = "!"
 
@@ -34,7 +34,12 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 # HELPERS
 # =========================
 
-def can_manage_application(member: discord.Member) -> bool:
+def safe_channel_name(username: str) -> str:
+    cleaned = "".join(ch for ch in username.lower() if ch.isalnum() or ch in ["-", "_"])
+    return cleaned[:20] if cleaned else "user"
+
+
+def can_manage_ticket(member: discord.Member) -> bool:
     required_role = member.guild.get_role(MIN_STAFF_ROLE_ID)
 
     if required_role is None:
@@ -43,9 +48,26 @@ def can_manage_application(member: discord.Member) -> bool:
     return member.top_role.position >= required_role.position
 
 
-def safe_channel_name(username: str) -> str:
-    cleaned = "".join(ch for ch in username.lower() if ch.isalnum() or ch in ["-", "_"])
-    return cleaned[:20] if cleaned else "user"
+def get_staff_roles_for_ticket(guild: discord.Guild):
+    """
+    Discord channel overwrites do not automatically include higher roles.
+    This adds the required role AND every role higher than it to the ticket.
+    """
+    required_role = guild.get_role(MIN_STAFF_ROLE_ID)
+
+    if required_role is None:
+        return []
+
+    staff_roles = []
+
+    for role in guild.roles:
+        if role.name == "@everyone":
+            continue
+
+        if role.position >= required_role.position:
+            staff_roles.append(role)
+
+    return staff_roles
 
 
 async def send_log(guild: discord.Guild, title: str, description: str, color: discord.Color):
@@ -63,126 +85,222 @@ async def send_log(guild: discord.Guild, title: str, description: str, color: di
     await channel.send(embed=embed)
 
 
+async def send_result_log(guild: discord.Guild, approved: bool, title: str, description: str, color: discord.Color):
+    channel_id = APPROVED_CHANNEL_ID if approved else DENIED_CHANNEL_ID
+    channel = guild.get_channel(channel_id)
+
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color
+    )
+
+    await channel.send(embed=embed)
+
+
+async def create_ticket_channel(
+    interaction: discord.Interaction,
+    ticket_name: str,
+    reason: str
+):
+    guild = interaction.guild
+    user = interaction.user
+    category = guild.get_channel(TICKET_CATEGORY_ID)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True
+        )
+    }
+
+    for role in get_staff_roles_for_ticket(guild):
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True
+        )
+
+    ticket_channel = await guild.create_text_channel(
+        name=ticket_name,
+        category=category,
+        overwrites=overwrites,
+        reason=reason
+    )
+
+    return ticket_channel
+
+
 # =========================
 # STAFF BUTTONS
 # =========================
 
-class ApplicationButtons(discord.ui.View):
+class TicketStaffButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Accept Applicant",
-        emoji="🔵",
+        label="Approve",
+        emoji="✅",
         style=discord.ButtonStyle.success,
-        custom_id="vxper_accept_applicant"
+        custom_id="vxper_ticket_approve"
     )
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_manage_application(interaction.user):
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_manage_ticket(interaction.user):
             return await interaction.response.send_message(
                 "❌ You do not have permission to use this button.",
                 ephemeral=True
             )
 
-        accepted_channel = interaction.guild.get_channel(ACCEPTED_APPLICATIONS_CHANNEL_ID)
+        is_rank = interaction.channel.name.startswith("rank-request-")
 
-        if accepted_channel:
-            embed = discord.Embed(
-                title="✅ Application Accepted",
-                description=(
-                    f"Applicant Ticket: {interaction.channel.mention}\n"
-                    f"Reviewed By: {interaction.user.mention}\n\n"
-                    "This applicant has been accepted into VXPER."
-                ),
-                color=discord.Color.green()
+        if is_rank:
+            public_message = (
+                "✅ Your high rank request has been approved.\n\n"
+                "A staff member will contact you shortly with the next steps."
             )
-            await accepted_channel.send(embed=embed)
+            log_title = "✅ High Rank Request Approved"
+            result_title = "✅ High Rank Request Approved"
+        else:
+            public_message = (
+                "✅ Congratulations!\n\n"
+                "Your VXPER application has been approved.\n"
+                "A staff member will contact you shortly with the next steps."
+            )
+            log_title = "✅ Guild Application Approved"
+            result_title = "✅ Guild Application Approved"
 
-        await interaction.response.send_message(
-            "✅ Congratulations!\n\n"
-            "Your application has been accepted into VXPER.\n"
-            "A recruiter will contact you shortly with the next steps."
+        await interaction.response.send_message(public_message)
+
+        result_description = (
+            f"Ticket: {interaction.channel.mention}\n"
+            f"Reviewed By: {interaction.user.mention}"
+        )
+
+        await send_result_log(
+            interaction.guild,
+            True,
+            result_title,
+            result_description,
+            discord.Color.green()
         )
 
         await send_log(
             interaction.guild,
-            "✅ Application Accepted",
+            log_title,
             f"Ticket: {interaction.channel.mention}\nStaff: {interaction.user.mention}",
             discord.Color.green()
         )
 
     @discord.ui.button(
-        label="Needs Interview",
+        label="Needs Discussion",
         emoji="🟡",
         style=discord.ButtonStyle.primary,
-        custom_id="vxper_needs_interview"
+        custom_id="vxper_ticket_discussion"
     )
-    async def interview(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_manage_application(interaction.user):
+    async def discussion(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_manage_ticket(interaction.user):
             return await interaction.response.send_message(
                 "❌ You do not have permission to use this button.",
                 ephemeral=True
             )
 
-        await interaction.response.send_message(
-            "🟡 Your application looks promising.\n\n"
-            "We'd like to conduct a short interview before making a final decision."
-        )
+        is_rank = interaction.channel.name.startswith("rank-request-")
+
+        if is_rank:
+            public_message = (
+                "🟡 Your high rank request needs further discussion with staff.\n\n"
+                "Please wait while the team reviews your request."
+            )
+            log_title = "🟡 High Rank Request Needs Discussion"
+        else:
+            public_message = (
+                "🟡 Your VXPER application needs further discussion with staff.\n\n"
+                "Please wait while the team reviews your application."
+            )
+            log_title = "🟡 Guild Application Needs Discussion"
+
+        await interaction.response.send_message(public_message)
 
         await send_log(
             interaction.guild,
-            "🟡 Interview Requested",
+            log_title,
             f"Ticket: {interaction.channel.mention}\nStaff: {interaction.user.mention}",
             discord.Color.gold()
         )
 
     @discord.ui.button(
-        label="Deny Applicant",
-        emoji="🔴",
+        label="Deny",
+        emoji="❌",
         style=discord.ButtonStyle.danger,
-        custom_id="vxper_deny_applicant"
+        custom_id="vxper_ticket_deny"
     )
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_manage_application(interaction.user):
+        if not can_manage_ticket(interaction.user):
             return await interaction.response.send_message(
                 "❌ You do not have permission to use this button.",
                 ephemeral=True
             )
 
-        denied_channel = interaction.guild.get_channel(DENIED_APPLICATIONS_CHANNEL_ID)
+        is_rank = interaction.channel.name.startswith("rank-request-")
 
-        if denied_channel:
-            embed = discord.Embed(
-                title="❌ Application Denied",
-                description=(
-                    f"Applicant Ticket: {interaction.channel.mention}\n"
-                    f"Reviewed By: {interaction.user.mention}\n\n"
-                    "This applicant has been denied."
-                ),
-                color=discord.Color.red()
+        if is_rank:
+            public_message = (
+                "❌ Your high rank request has been denied at this time.\n\n"
+                "You may request again in the future if your activity or contribution improves."
             )
-            await denied_channel.send(embed=embed)
+            log_title = "❌ High Rank Request Denied"
+            result_title = "❌ High Rank Request Denied"
+        else:
+            public_message = (
+                "❌ Unfortunately, your VXPER application has not been approved at this time.\n\n"
+                "Thank you for your interest in VXPER."
+            )
+            log_title = "❌ Guild Application Denied"
+            result_title = "❌ Guild Application Denied"
 
-        await interaction.response.send_message(
-            "❌ Unfortunately your application has not been accepted at this time.\n\n"
-            "Thank you for your interest in VXPER and feel free to apply again in the future."
+        await interaction.response.send_message(public_message)
+
+        result_description = (
+            f"Ticket: {interaction.channel.mention}\n"
+            f"Reviewed By: {interaction.user.mention}"
+        )
+
+        await send_result_log(
+            interaction.guild,
+            False,
+            result_title,
+            result_description,
+            discord.Color.red()
         )
 
         await send_log(
             interaction.guild,
-            "❌ Application Denied",
+            log_title,
             f"Ticket: {interaction.channel.mention}\nStaff: {interaction.user.mention}",
             discord.Color.red()
         )
 
     @discord.ui.button(
-        label="Close Ticket",
+        label="Close",
         emoji="🔒",
         style=discord.ButtonStyle.secondary,
-        custom_id="vxper_close_ticket"
+        custom_id="vxper_ticket_close"
     )
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_manage_application(interaction.user):
+        if not can_manage_ticket(interaction.user):
             return await interaction.response.send_message(
                 "❌ You do not have permission to use this button.",
                 ephemeral=True
@@ -196,22 +314,22 @@ class ApplicationButtons(discord.ui.View):
         )
 
         await interaction.response.send_message("🔒 Closing this ticket...")
-        await interaction.channel.delete(reason=f"VXPER application closed by {interaction.user}")
+        await interaction.channel.delete(reason=f"VXPER ticket closed by {interaction.user}")
 
 
 # =========================
-# APPLY VIEW
+# PANEL BUTTONS
 # =========================
 
-class ApplyView(discord.ui.View):
+class GuildApplicationView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Apply Now",
+        label="Apply To VXPER",
         emoji="📝",
         style=discord.ButtonStyle.primary,
-        custom_id="vxper_apply_now"
+        custom_id="vxper_guild_apply"
     )
     async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
@@ -226,47 +344,24 @@ class ApplyView(discord.ui.View):
                 ephemeral=True
             )
 
-        required_role = guild.get_role(MIN_STAFF_ROLE_ID)
-        ticket_category = guild.get_channel(APPLICATION_CATEGORY_ID)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            ),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True
-            )
-        }
-
-        if required_role:
-            overwrites[required_role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
-
-        ticket_channel = await guild.create_text_channel(
-            name=ticket_name,
-            category=ticket_category,
-            overwrites=overwrites,
-            reason=f"VXPER application opened by {user}"
+        ticket_channel = await create_ticket_channel(
+            interaction,
+            ticket_name,
+            f"VXPER guild application opened by {user}"
         )
 
         embed = discord.Embed(
-            title="⚔️ VXPER Application",
+            title="⚔️ VXPER Guild Application",
             description=(
                 f"Welcome {user.mention} to your VXPER application ticket.\n\n"
-                "Please tell us:\n\n"
-                "• Your username\n"
-                "• Why you want to join VXPER\n"
-                "• Anything else you'd like us to know\n\n"
-                "A recruiter will review your application as soon as possible."
+                "Please answer these questions:\n\n"
+                "• What is your username?\n"
+                "• Why do you want to join VXPER?\n"
+                "• How many carrots do you have?\n"
+                "• Are you able to AFK consistently?\n"
+                "• How active are you?\n"
+                "• Anything else you'd like us to know?\n\n"
+                "A staff member will review your application soon."
             ),
             color=discord.Color.blue()
         )
@@ -274,18 +369,82 @@ class ApplyView(discord.ui.View):
         await ticket_channel.send(
             content=user.mention,
             embed=embed,
-            view=ApplicationButtons()
+            view=TicketStaffButtons()
         )
 
         await send_log(
             guild,
-            "📝 Application Opened",
+            "📝 Guild Application Opened",
             f"Applicant: {user.mention}\nTicket: {ticket_channel.mention}",
             discord.Color.blue()
         )
 
         await interaction.response.send_message(
-            f"✅ Your application ticket has been created: {ticket_channel.mention}",
+            f"✅ Your VXPER application ticket has been created: {ticket_channel.mention}",
+            ephemeral=True
+        )
+
+
+class HighRankRequestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Request High Rank",
+        emoji="👑",
+        style=discord.ButtonStyle.primary,
+        custom_id="vxper_high_rank_request"
+    )
+    async def request_rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        user = interaction.user
+
+        ticket_name = f"rank-request-{safe_channel_name(user.name)}"
+        existing = discord.utils.get(guild.text_channels, name=ticket_name)
+
+        if existing:
+            return await interaction.response.send_message(
+                f"❌ You already have a high rank request ticket open: {existing.mention}",
+                ephemeral=True
+            )
+
+        ticket_channel = await create_ticket_channel(
+            interaction,
+            ticket_name,
+            f"VXPER high rank request opened by {user}"
+        )
+
+        embed = discord.Embed(
+            title="👑 VXPER High Rank Request",
+            description=(
+                f"Welcome {user.mention} to your high rank request ticket.\n\n"
+                "Please answer these questions:\n\n"
+                "• What is your current rank?\n"
+                "• What rank are you requesting?\n"
+                "• Why do you think you deserve high rank?\n"
+                "• How have you helped VXPER?\n"
+                "• How active are you?\n"
+                "• Do you have any proof/screenshots?\n\n"
+                "A staff member will review your request soon."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await ticket_channel.send(
+            content=user.mention,
+            embed=embed,
+            view=TicketStaffButtons()
+        )
+
+        await send_log(
+            guild,
+            "👑 High Rank Request Opened",
+            f"Member: {user.mention}\nTicket: {ticket_channel.mention}",
+            discord.Color.gold()
+        )
+
+        await interaction.response.send_message(
+            f"✅ Your high rank request ticket has been created: {ticket_channel.mention}",
             ephemeral=True
         )
 
@@ -294,24 +453,44 @@ class ApplyView(discord.ui.View):
 # COMMANDS
 # =========================
 
-@bot.command(name="panel")
+@bot.command(name="applypanel")
 @commands.has_permissions(administrator=True)
-async def panel(ctx: commands.Context):
+async def applypanel(ctx: commands.Context):
     embed = discord.Embed(
-        title="⚔️ Welcome to VXPER Applications",
+        title="⚔️ VXPER Guild Applications",
         description=(
-            "Interested in joining VXPER?\n\n"
-            "Click the button below to open an application ticket and speak with our recruitment team.\n\n"
-            "Please be patient while we review your application.\n\n"
+            "Want to join VXPER?\n\n"
+            "Click the button below to open a guild application ticket.\n\n"
+            "Please make sure you meet the requirements before applying:\n"
+            "🥕 Carrots\n"
+            "💤 Able to AFK\n"
+            "🟢 Consistently active\n\n"
             "Good luck! ⚔️"
         ),
         color=discord.Color.blue()
     )
 
-    await ctx.send(embed=embed, view=ApplyView())
+    await ctx.send(embed=embed, view=GuildApplicationView())
 
 
-@panel.error
+@bot.command(name="rankpanel")
+@commands.has_permissions(administrator=True)
+async def rankpanel(ctx: commands.Context):
+    embed = discord.Embed(
+        title="👑 VXPER High Rank Requests",
+        description=(
+            "Want to request a higher rank in VXPER?\n\n"
+            "Click the button below to open a high rank request ticket.\n\n"
+            "Staff will review your activity, contribution, and reason for requesting high rank."
+        ),
+        color=discord.Color.gold()
+    )
+
+    await ctx.send(embed=embed, view=HighRankRequestView())
+
+
+@applypanel.error
+@rankpanel.error
 async def panel_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You need administrator permission to use this command.")
@@ -326,9 +505,11 @@ async def panel_error(ctx: commands.Context, error):
 
 @bot.event
 async def on_ready():
-    bot.add_view(ApplyView())
-    bot.add_view(ApplicationButtons())
+    bot.add_view(GuildApplicationView())
+    bot.add_view(HighRankRequestView())
+    bot.add_view(TicketStaffButtons())
     print(f"Logged in as {bot.user}")
+    print("VXPER Ticket Bot is online.")
 
 
 # =========================
